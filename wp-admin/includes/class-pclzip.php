@@ -2201,11 +2201,11 @@
     // ----- Go to beginning of File
     @rewind($this->zip_fd);
 
-    // ----- Creates a temporary file
-    $v_zip_temp_name = PCLZIP_TEMPORARY_DIR.uniqid('pclzip-').'.tmp';
+    // ----- Creates a temporary file (unpredictable name, exclusive creation)
+    $v_zip_temp_name = PclZipUtilTemporaryFile(PCLZIP_TEMPORARY_DIR, '.tmp', $v_zip_temp_fd);
 
-    // ----- Open the temporary file in write mode
-    if (($v_zip_temp_fd = @fopen($v_zip_temp_name, 'wb')) == 0)
+    // ----- Check the temporary file creation
+    if ($v_zip_temp_fd === FALSE)
     {
       $this->privCloseFd();
       $this->privSwapBackMagicQuotes();
@@ -2817,10 +2817,18 @@
       return PclZip::errorCode();
     }
 
-    // ----- Creates a compressed temporary file
-    $v_gzip_temp_name = PCLZIP_TEMPORARY_DIR.uniqid('pclzip-').'.gz';
+    // ----- Creates a compressed temporary file (unpredictable name,
+    //       exclusive creation)
+    $v_gzip_temp_name = PclZipUtilTemporaryFile(PCLZIP_TEMPORARY_DIR, '.gz', $v_gzip_temp_fd);
+    if ($v_gzip_temp_fd === FALSE) {
+      fclose($v_file);
+      PclZip::privErrorLog(PCLZIP_ERR_WRITE_OPEN_FAIL, 'Unable to create temporary file in \''.PCLZIP_TEMPORARY_DIR.'\'');
+      return PclZip::errorCode();
+    }
+    @fclose($v_gzip_temp_fd);
     if (($v_file_compressed = @gzopen($v_gzip_temp_name, "wb")) == 0) {
       fclose($v_file);
+      @unlink($v_gzip_temp_name);
       PclZip::privErrorLog(PCLZIP_ERR_WRITE_OPEN_FAIL, 'Unable to open temporary file \''.$v_gzip_temp_name.'\' in binary write mode');
       return PclZip::errorCode();
     }
@@ -3674,6 +3682,26 @@
       }
     }
 
+    // ----- Check the entry filename for directory traversal
+    // The stored filename is archive controlled : it must stay a relative
+    // path inside the extraction directory. Entries with '..' path
+    // segments, with an absolute path or with a Windows drive prefix
+    // would otherwise be written outside of $p_path : skip them.
+    $v_entry_filename = str_replace('\\', '/', $p_entry['filename']);
+    if (   ($v_entry_filename == '..')
+        || (substr($v_entry_filename, 0, 3) == '../')
+        || (substr($v_entry_filename, -3) == '/..')
+        || (strpos($v_entry_filename, '/../') !== false)
+        || (substr($v_entry_filename, 0, 1) == '/')
+        || (preg_match('/^[a-zA-Z]:/', $v_entry_filename) == 1)) {
+
+        // ----- Change the file status
+        $p_entry['status'] = "filtered";
+
+        // ----- Return
+        return $v_result;
+    }
+
     // ----- Add the path
     if ($p_path != '') {
       $p_entry['filename'] = $p_path."/".$p_entry['filename'];
@@ -3978,11 +4006,10 @@
   {
     $v_result=1;
 
-    // ----- Creates a temporary file
-    $v_gzip_temp_name = PCLZIP_TEMPORARY_DIR.uniqid('pclzip-').'.gz';
-    if (($v_dest_file = @fopen($v_gzip_temp_name, "wb")) == 0) {
-      fclose($v_file);
-      PclZip::privErrorLog(PCLZIP_ERR_WRITE_OPEN_FAIL, 'Unable to open temporary file \''.$v_gzip_temp_name.'\' in binary write mode');
+    // ----- Creates a temporary file (unpredictable name, exclusive creation)
+    $v_gzip_temp_name = PclZipUtilTemporaryFile(PCLZIP_TEMPORARY_DIR, '.gz', $v_dest_file);
+    if ($v_dest_file === FALSE) {
+      PclZip::privErrorLog(PCLZIP_ERR_WRITE_OPEN_FAIL, 'Unable to create temporary file in \''.PCLZIP_TEMPORARY_DIR.'\'');
       return PclZip::errorCode();
     }
 
@@ -4340,6 +4367,23 @@
     // ----- Extract the values
     $v_data = unpack('vversion/vflag/vcompression/vmtime/vmdate/Vcrc/Vcompressed_size/Vsize/vfilename_len/vextra_len', $v_binary_data);
 
+    // ----- Check that the compressed size is coherent with the archive size
+    // The compressed data of an entry can not be bigger than the archive
+    // itself. A forged header with a bigger size would otherwise drive a
+    // one-shot read/allocation of that size during extraction.
+    $v_stat = @fstat($this->zip_fd);
+    if (   ($v_stat !== false)
+        && ($v_data['compressed_size'] > $v_stat['size'])) {
+      $p_header['filename'] = "";
+      $p_header['status'] = "invalid_header";
+
+      // ----- Error log
+      PclZip::privErrorLog(PCLZIP_ERR_INVALID_ARCHIVE_ZIP, 'Invalid archive size');
+
+      // ----- Return
+      return PclZip::errorCode();
+    }
+
     // ----- Get filename
     $p_header['filename'] = fread($this->zip_fd, $v_data['filename_len']);
 
@@ -4442,6 +4486,22 @@
 
     // ----- Extract the values
     $p_header = unpack('vversion/vversion_extracted/vflag/vcompression/vmtime/vmdate/Vcrc/Vcompressed_size/Vsize/vfilename_len/vextra_len/vcomment_len/vdisk/vinternal/Vexternal/Voffset', $v_binary_data);
+
+    // ----- Check that the entry offset and compressed size are coherent
+    // with the real size of the archive
+    $v_archive_size = @filesize($this->zipname);
+    if (   ($p_header['offset'] > $v_archive_size)
+        || ($p_header['compressed_size'] > ($v_archive_size - $p_header['offset'])))
+    {
+      $p_header['filename'] = "";
+      $p_header['status'] = "invalid_header";
+
+      // ----- Error log
+      PclZip::privErrorLog(PCLZIP_ERR_BAD_FORMAT, "Invalid offset or compressed size in central file header");
+
+      // ----- Return
+      return PclZip::errorCode();
+    }
 
     // ----- Get filename
     if ($p_header['filename_len'] != 0)
@@ -4660,6 +4720,19 @@
     // ----- Extract the values
     $v_data = unpack('vdisk/vdisk_start/vdisk_entries/ventries/Vsize/Voffset/vcomment_size', $v_binary_data);
 
+    // ----- Check that the central directory offset and size are coherent
+    // with the real size of the archive
+    if (   ($v_data['offset'] > $v_size)
+        || ($v_data['size'] > ($v_size - $v_data['offset'])))
+    {
+
+      // ----- Error log
+      PclZip::privErrorLog(PCLZIP_ERR_BAD_FORMAT, "Invalid central directory offset or size");
+
+      // ----- Return
+      return PclZip::errorCode();
+    }
+
     // ----- Check the global size
     if (($v_pos + $v_data['comment_size'] + 18) != $v_size) {
 
@@ -4854,8 +4927,18 @@
     // ----- Look if something need to be deleted
     if ($v_nb_extracted > 0) {
 
-        // ----- Creates a temporary file
-        $v_zip_temp_name = PCLZIP_TEMPORARY_DIR.uniqid('pclzip-').'.tmp';
+        // ----- Creates a temporary file (unpredictable name, exclusive creation)
+        $v_zip_temp_name = PclZipUtilTemporaryFile(PCLZIP_TEMPORARY_DIR, '.tmp', $v_zip_temp_fd);
+        if ($v_zip_temp_fd === FALSE) {
+            $this->privCloseFd();
+
+            // ----- Error log
+            PclZip::privErrorLog(PCLZIP_ERR_WRITE_OPEN_FAIL, 'Unable to create temporary file in \''.PCLZIP_TEMPORARY_DIR.'\'');
+
+            // ----- Return
+            return PclZip::errorCode();
+        }
+        @fclose($v_zip_temp_fd);
 
         // ----- Creates a temporary zip archive
         $v_temp_zip = new PclZip($v_zip_temp_name);
@@ -5138,11 +5221,11 @@
     // ----- Go to beginning of File
     @rewind($p_archive_to_add->zip_fd);
 
-    // ----- Creates a temporary file
-    $v_zip_temp_name = PCLZIP_TEMPORARY_DIR.uniqid('pclzip-').'.tmp';
+    // ----- Creates a temporary file (unpredictable name, exclusive creation)
+    $v_zip_temp_name = PclZipUtilTemporaryFile(PCLZIP_TEMPORARY_DIR, '.tmp', $v_zip_temp_fd);
 
-    // ----- Open the temporary file in write mode
-    if (($v_zip_temp_fd = @fopen($v_zip_temp_name, 'wb')) == 0)
+    // ----- Check the temporary file creation
+    if ($v_zip_temp_fd === FALSE)
     {
       $this->privCloseFd();
       $p_archive_to_add->privCloseFd();
@@ -5636,6 +5719,58 @@
 
     // ----- Return
     return $v_result;
+  }
+  // --------------------------------------------------------------------------------
+
+  // --------------------------------------------------------------------------------
+  // Function : PclZipUtilTemporaryFile()
+  // Description :
+  //   Create a temporary file in a way that is safe against temporary file
+  //   hijacking :
+  //   - the file name includes a random part with enough entropy to be
+  //     unpredictable by another process sharing the temporary directory,
+  //   - the file is created with the 'x' (exclusive creation) mode, so the
+  //     creation fails instead of overwriting an existing file or following
+  //     a symbolic link already placed at the same path.
+  // Parameters :
+  //   $p_dir : directory (with trailing separator) hosting the temporary file.
+  //   $p_suffix : suffix to append to the file name (like '.tmp' or '.gz').
+  //   $p_file : reference set to the opened file resource on success, or to
+  //             FALSE on failure.
+  // Return Values :
+  //   The temporary file name on success, an empty string on failure.
+  // --------------------------------------------------------------------------------
+  function PclZipUtilTemporaryFile($p_dir, $p_suffix, &$p_file)
+  {
+    $v_name = '';
+    $p_file = FALSE;
+
+    // ----- Try several times, in case of a name collision or a concurrent
+    //       creation of a file with the same name
+    for ($i=0; ($i<10) && ($p_file === FALSE); $i++) {
+
+      // ----- Generate an unpredictable file name
+      if (function_exists('random_bytes')) {
+        try {
+          $v_random = bin2hex(random_bytes(16));
+        }
+        catch (Exception $e) {
+          $v_random = uniqid('', true);
+        }
+      }
+      else {
+        $v_random = uniqid('', true);
+      }
+      $v_name = $p_dir.'pclzip-'.$v_random.$p_suffix;
+
+      // ----- Create the file in exclusive mode : the creation fails if the
+      //       name is already used by a file or a symbolic link, instead of
+      //       overwriting or following it
+      $p_file = @fopen($v_name, 'xb');
+    }
+
+    // ----- Return
+    return ($p_file === FALSE ? '' : $v_name);
   }
   // --------------------------------------------------------------------------------
 

@@ -119,36 +119,57 @@ class Core_Upgrader extends WP_Upgrader {
 			$to_download = 'full';
 		}
 
+		$package_url = $current->packages->$to_download;
+
+		/*
+		 * Core updates must be cryptographically verified before installation.
+		 *
+		 * download_url() only attempts signature verification for hosts on the
+		 * signature allow list; a package offered by any other host would be
+		 * installed without its authenticity being checked at all. Fail closed
+		 * in that case instead of installing an unverifiable package over core.
+		 */
+		$signed_hostnames = apply_filters( 'wp_signature_hosts', array( 'wordpress.org', 'downloads.wordpress.org', 's.w.org' ) );
+		$package_host     = is_string( $package_url ) ? parse_url( $package_url, PHP_URL_HOST ) : null;
+
+		if ( ! $package_host || ! in_array( $package_host, $signed_hostnames, true ) ) {
+			return new WP_Error(
+				'signature_verification_unsupported_host',
+				sprintf(
+					/* translators: %s: Package URL. */
+					__( 'The authenticity of the update package from %s could not be verified.' ),
+					'<span class="code">' . esc_html( is_string( $package_url ) ? $package_url : '' ) . '</span>'
+				)
+			);
+		}
+
 		// Lock to prevent multiple Core Updates occurring.
 		$lock = WP_Upgrader::create_lock( 'core_updater', 15 * MINUTE_IN_SECONDS );
 		if ( ! $lock ) {
 			return new WP_Error( 'locked', $this->strings['locked'] );
 		}
 
-		$download = $this->download_package( $current->packages->$to_download, false );
+		$download = $this->download_package( $package_url, true );
 
 		/*
-		 * Allow for signature soft-fail.
-		 * WARNING: This may be removed in the future.
+		 * Signature verification failures are fatal for core updates.
+		 * A signature failure must not soft-fail here: an unverified
+		 * package must never be installed over core.
 		 */
-		if ( is_wp_error( $download ) && $download->get_error_data( 'softfail-filename' ) ) {
-			// Output the failure error as a normal feedback, and not as an error:
-			/** This filter is documented in wp-admin/includes/update-core.php */
-			apply_filters( 'update_feedback', $download->get_error_message() );
-
-			// Report this failure back to WordPress.org for debugging purposes.
-			wp_version_check(
-				array(
-					'signature_failure_code' => $download->get_error_code(),
-					'signature_failure_data' => $download->get_error_data(),
-				)
-			);
-
-			// Pretend this error didn't happen.
-			$download = $download->get_error_data( 'softfail-filename' );
-		}
-
 		if ( is_wp_error( $download ) ) {
+			if ( $download->get_error_data( 'softfail-filename' ) ) {
+				// Delete the unverified package.
+				wp_delete_file( $download->get_error_data( 'softfail-filename' ) );
+
+				// Report this failure back to WordPress.org for debugging purposes.
+				wp_version_check(
+					array(
+						'signature_failure_code' => $download->get_error_code(),
+						'signature_failure_data' => $download->get_error_data(),
+					)
+				);
+			}
+
 			WP_Upgrader::release_lock( 'core_updater' );
 			return $download;
 		}

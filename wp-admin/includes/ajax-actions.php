@@ -388,7 +388,7 @@ function wp_ajax_get_community_events() {
 
 	check_ajax_referer( 'community_events' );
 
-	$search         = isset( $_POST['location'] ) ? wp_unslash( $_POST['location'] ) : '';
+	$search         = isset( $_POST['location'] ) && is_string( $_POST['location'] ) ? sanitize_text_field( wp_unslash( $_POST['location'] ) ) : '';
 	$timezone       = isset( $_POST['timezone'] ) ? wp_unslash( $_POST['timezone'] ) : '';
 	$user_id        = get_current_user_id();
 	$saved_location = get_user_option( 'community-events-location', $user_id );
